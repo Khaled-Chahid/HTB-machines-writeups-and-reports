@@ -1,0 +1,59 @@
+## Assessment Summary
+
+Weak, guessable administrator credentials on the Nibbleblog CMS allowed authenticated plugin-based file upload, resulting in remote code execution as the low-privileged `nibbler` service account. A misconfigured `sudo` rule granting passwordless execution of a non-existent script was then abused to escalate to `root`.
+
+**Scope:** 10.10.10.75 in the HTB lab. This report is based on the supplied official writeup; the findings were not independently retested.
+
+| ID | Finding | Severity |
+|---|---|---|
+| NIB-01 | Hidden Nibbleblog admin panel disclosed via HTML comment and directory brute-forcing | Low |
+| NIB-02 | Weak/guessable Nibbleblog administrator credentials enabling arbitrary file upload (RCE) | High |
+| NIB-03 | Misconfigured `sudo` NOPASSWD rule on a non-existent script | High |
+
+---
+
+### NIB-01 — Nibbleblog Admin Panel Disclosed via Information Leakage
+
+**Affected service:** Apache HTTP (port 80).
+
+The front page's HTML source contained a developer comment referencing a `/nibbleblog/` directory described as "nothing interesting here." Directory brute-forcing with DirBuster against that path nonetheless enumerated `admin.php`, `index.php`, and `feed.php`, revealing a full CMS installation and its administration interface.
+
+**Verification:** Viewing the page source of `index.html` showed the comment pointing to `/nibbleblog/`. A DirBuster scan against `http://10.10.10.75:80/nibbleblog/` returned HTTP 200 for `admin.php`, confirming a reachable login panel.
+
+**Impact:** The disclosed admin interface became the entry point for the credential-based attack in NIB-02. Even where no vulnerability exists in the panel itself, exposing an undocumented admin interface increases the attack surface available to an external attacker.
+
+**Remediation:** Remove developer comments that reference internal paths from production code. Restrict access to administrative interfaces by IP allow-listing or placing them behind authentication at the network layer. Periodically audit the web root for content that should not be publicly reachable.
+
+---
+
+### NIB-02 — Weak Nibbleblog Administrator Credentials Enabling File Upload RCE
+
+**Affected component:** Nibbleblog 4.0.3 admin panel and image-upload plugin.
+
+The Nibbleblog installation enforces a login blacklist that blocks automated brute-forcing, but the valid username was enumerated from the unauthenticated file `/nibbleblog/content/private/users.xml`. With the username known, a single manual credential guess (`admin:nibbles`) succeeded. Authenticated access to the admin panel allowed abuse of the image-upload plugin to upload a malicious PHP file disguised as an image, which executed arbitrary PHP code on the server when requested directly.
+
+**Verification:** The Metasploit module `exploit/multi/http/nibbleblog_file_upload` was configured with the recovered credentials (`admin:nibbles`) and a `php/meterpreter/reverse_tcp` payload (`LHOST 10.10.14.10`, `LPORT 4444`). Running the module returned a Meterpreter session on the target, confirming code execution as the web service account.
+
+**Impact:** An attacker with network access to the application, able to recover or guess valid admin credentials, can achieve remote code execution as the web service account, with access to the local filesystem and any locally reachable resources.
+
+**Remediation:** Enforce strong, unique passwords for all CMS administrator accounts and enable multi-factor authentication where supported. Restrict access to `/content/private/` so credential/user metadata files are not directly retrievable. Disable or restrict plugins that allow arbitrary file upload, and validate uploaded file types/content server-side rather than relying on client-reported extensions. Keep the CMS patched to the latest version.
+
+---
+
+### NIB-03 — Misconfigured Sudo Rule Permits Privilege Escalation to Root
+
+**Affected component:** `sudoers` configuration for the `nibbler` account.
+
+Running `sudo -l` as the `nibbler` user revealed a NOPASSWD entry permitting execution of `/home/nibbler/personal/stuff/monitor.sh` as root. The referenced script did not exist on the filesystem, so an attacker with write access to that path could create their own script there and have it executed with full root privileges via `sudo`.
+
+**Verification:** A `monitor.sh` script containing `bash -i` was transferred to the target (`wget` from the attacker's HTTP server), made executable (`chmod +x`), and placed at the expected path. Running `sudo /home/nibbler/personal/stuff/monitor.sh` spawned an interactive shell; `id` confirmed `uid=0(root) gid=0(root) groups=0(root)`.
+
+**Impact:** Full compromise of the host. Any attacker who obtains the `nibbler` account (as achieved in NIB-02) can trivially escalate to root due to the dangling, passwordless sudo rule.
+
+**Remediation:** Remove `sudoers` entries that reference files which do not exist, or that point to paths writable by the invoking user. Apply the principle of least privilege to `sudo` rules, scoping them to specific, immutable, root-owned scripts. Regularly audit `sudo -l` output across all accounts as part of host hardening.
+
+---
+
+### Remediation Priority
+
+First harden CMS administrator credentials and restrict access to `/content/private/` to prevent username disclosure and credential-based RCE (NIB-02), and remove the information-leaking comment (NIB-01). Then correct the dangling `sudo` rule for `nibbler` (NIB-03), since it provides a direct path to root from a low-privileged foothold. Verify remediation by re-running `sudo -l` for all local accounts and confirming the admin panel is no longer reachable with default or guessable credentials.

